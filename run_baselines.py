@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Run three baselines (simple, medium, strong) with Qwen2.5-1.5B-Instruct.
-Single command: installs deps, downloads data, trains, evaluates, outputs metrics.
-Usage: python run_baselines.py [--skip-install] [--skip-download] [--data-dir DIR] [--output-dir DIR]
+- Default: installs deps, downloads data, trains, evaluates, outputs metrics.
+- Eval-only: load baseline models from Hugging Face Hub and run evaluations only.
+Usage:
+  python run_baselines.py [--skip-install] [--skip-download] [--data-dir DIR] [--output-dir DIR]
+  python run_baselines.py --eval-only --hub-repo-simple USER/gsm8k-baseline-simple --hub-repo-medium USER/gsm8k-baseline-medium --hub-repo-strong USER/gsm8k-baseline-strong
+  python run_baselines.py --eval-only --hub-username USER  # repos: USER/gsm8k-baseline-{simple,medium,strong}
 """
 
 import argparse
@@ -439,6 +443,87 @@ def run_baseline(
 
 
 # -----------------------------------------------------------------------------
+# Eval-only: load baseline from Hugging Face Hub and run evaluations
+# -----------------------------------------------------------------------------
+def eval_baseline_from_hub(
+    hub_repo_id: str,
+    label: str,
+    gsm8k_train,
+    gsm8k_train_si,
+    gsm8k_test_public,
+    gsm8k_test_private,
+    ailuminate_test,
+    eval_config: dict,
+):
+    """Load a baseline model from Hugging Face Hub and run GSM8K + AILuminate evaluation."""
+    torch, Dataset, LoraConfig, PeftModel, get_peft_model, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline, tqdm, SFTConfig, SFTTrainer = ensure_imports()
+    random.seed(SEED)
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+    # Load tokenizer from Hub (has [PAD] etc.); fallback to base model if not on Hub
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(hub_repo_id)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    base = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        quantization_config=bnb_config,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map="auto",
+    )
+    if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    base.resize_token_embeddings(len(tokenizer))
+    model = PeftModel.from_pretrained(base, hub_repo_id, torch_dtype=torch.bfloat16)
+    max_new_tokens = eval_config.get("max_new_tokens", 256)
+    do_sample = eval_config.get("do_sample", True)
+    temperature = eval_config.get("temperature", 0.6)
+    top_p = eval_config.get("top_p", 0.9)
+    test_n_shot = eval_config.get("test_n_shot", 1)
+    fixed_test = eval_config.get("fixed_fewshot_for_test", None)
+    test_fewshot_data = eval_config.get("test_fewshot_data", gsm8k_train)
+    generator = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer,
+        pad_token_id=tokenizer.eos_token_id,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature if do_sample else None,
+        top_p=top_p if do_sample else None,
+    )
+    acc, gsm8k_pub = eval_gsm8k(
+        generator, gsm8k_test_public, test_fewshot_data, test_n_shot, fixed_test,
+        max_new_tokens, do_sample, temperature, top_p, limit=GSM8K_PUBLIC_LIMIT,
+    )
+    gsm8k_priv = run_gsm8k_private(
+        generator, gsm8k_test_private, test_fewshot_data, test_n_shot, fixed_test,
+        max_new_tokens, do_sample, temperature, top_p, limit=GSM8K_PRIVATE_LIMIT,
+    )
+    ailuminate_preds = run_ailuminate(
+        generator, ailuminate_test, max_new_tokens, do_sample, temperature, top_p,
+    )
+    metrics = {
+        "baseline": label,
+        "gsm8k_public_accuracy": round(acc, 4),
+        "checkpoint_evaluated": hub_repo_id,
+    }
+    submission = gsm8k_pub + gsm8k_priv + ailuminate_preds
+    del model
+    del base
+    del generator
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return metrics, submission
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main():
@@ -449,15 +534,33 @@ def main():
     parser.add_argument("--output-dir", type=str, default=".", help="Output directory for checkpoints and results")
     parser.add_argument("--baseline", type=str, choices=["simple", "medium", "strong", "all"], default="all",
                         help="Which baseline(s) to run")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="Load baseline models from Hugging Face Hub and run evaluations only (no training)")
+    parser.add_argument("--hub-username", type=str, default=None,
+                        help="HF username/org; repos = {hub_username}/gsm8k-baseline-{simple,medium,strong}. Ignored if --hub-repo-* are set.")
+    parser.add_argument("--hub-repo-simple", type=str, default=None, help="Hugging Face repo for simple baseline (e.g. USER/gsm8k-baseline-simple)")
+    parser.add_argument("--hub-repo-medium", type=str, default=None, help="Hugging Face repo for medium baseline")
+    parser.add_argument("--hub-repo-strong", type=str, default=None, help="Hugging Face repo for strong baseline")
     args = parser.parse_args()
     data_dir = Path(args.data_dir)
     output_base = Path(args.output_dir)
 
+    eval_only = args.eval_only
+    hub_simple = hub_medium = hub_strong = None
+    if eval_only:
+        hub_simple = args.hub_repo_simple or (f"{args.hub_username}/gsm8k-baseline-simple" if args.hub_username else None)
+        hub_medium = args.hub_repo_medium or (f"{args.hub_username}/gsm8k-baseline-medium" if args.hub_username else None)
+        hub_strong = args.hub_repo_strong or (f"{args.hub_username}/gsm8k-baseline-strong" if args.hub_username else None)
+        if not all([hub_simple, hub_medium, hub_strong]):
+            parser.error("--eval-only requires either --hub-username or all of --hub-repo-simple, --hub-repo-medium, --hub-repo-strong")
+
     print("=" * 60)
     print("BASELINES: Simple / Medium / Strong (Qwen2.5-1.5B-Instruct)")
+    if eval_only:
+        print("MODE: Eval-only (load models from Hugging Face Hub)")
     print("=" * 60)
 
-    if not args.skip_install:
+    if not args.skip_install and not eval_only:
         print("Installing dependencies...")
         do_install()
         print("Done.")
@@ -565,23 +668,41 @@ def main():
     results = {}
     to_run = []
     if args.baseline in ("simple", "all"):
-        to_run.append(("simple baseline", "simple", simple_config))
+        to_run.append(("simple baseline", "simple", simple_config, hub_simple if eval_only else None))
     if args.baseline in ("medium", "all"):
-        to_run.append(("medium baseline", "medium", medium_config))
+        to_run.append(("medium baseline", "medium", medium_config, hub_medium if eval_only else None))
     if args.baseline in ("strong", "all"):
-        to_run.append(("strong baseline", "strong", strong_config))
+        to_run.append(("strong baseline", "strong", strong_config, hub_strong if eval_only else None))
 
-    for label, name, config in to_run:
+    for label, name, config, hub_repo in to_run:
         print("\n" + "=" * 60)
         print(f"Running: {label}")
         print("=" * 60)
-        metrics, submission = run_baseline(
-            name, data_dir, output_base,
-            gsm8k_train, gsm8k_train_si,
-            gsm8k_test_public, gsm8k_test_private,
-            ailuminate_test,
-            config,
-        )
+        if eval_only and hub_repo:
+            eval_config = {
+                "test_fewshot_data": config["test_fewshot_data"],
+                "test_n_shot": config["test_n_shot"],
+                "fixed_fewshot_for_test": config["fixed_fewshot_for_test"],
+                "max_new_tokens": config["max_new_tokens"],
+                "do_sample": config["do_sample"],
+                "temperature": config["temperature"],
+                "top_p": config["top_p"],
+            }
+            metrics, submission = eval_baseline_from_hub(
+                hub_repo, name,
+                gsm8k_train, gsm8k_train_si,
+                gsm8k_test_public, gsm8k_test_private,
+                ailuminate_test,
+                eval_config,
+            )
+        else:
+            metrics, submission = run_baseline(
+                name, data_dir, output_base,
+                gsm8k_train, gsm8k_train_si,
+                gsm8k_test_public, gsm8k_test_private,
+                ailuminate_test,
+                config,
+            )
         results[label] = metrics
         out_txt = output_base / f"submission_{name}.txt"
         with open(out_txt, "w") as f:
